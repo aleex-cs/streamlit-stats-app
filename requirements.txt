@@ -1,5 +1,6 @@
-streamlit
-pandas
 numpy
 requests
+streamlit
+pandas
 plotly
+streamlit-aggrid
