@@ -13,64 +13,6 @@ from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 LOCAL_TZ = "Europe/Madrid"
 
 st.set_page_config(page_title="Music Stats", layout="wide")
-st.markdown("""
-<style>
-/* Fondo general azul oscuro en todos los wrappers/contendedores */
-.ag-theme-alpine-dark .ag-root-wrapper,
-.ag-theme-alpine-dark .ag-root,
-.ag-theme-alpine-dark .ag-center-cols-viewport,
-.ag-theme-alpine-dark .ag-center-cols-container,
-.ag-theme-alpine-dark .ag-body-viewport,
-.ag-theme-alpine-dark .ag-body-horizontal-scroll-viewport,
-.ag-theme-alpine-dark .ag-body-vertical-scroll-viewport {
-    background-color: #1b263b !important; /* azul oscuro */
-}
-
-/* Forzar fondo en filas y en CADA celda (clave para evitar "zebra" blanca) */
-.ag-theme-alpine-dark .ag-row,
-.ag-theme-alpine-dark .ag-row .ag-cell,
-.ag-theme-alpine-dark .ag-row-even .ag-cell,
-.ag-theme-alpine-dark .ag-row-odd .ag-cell {
-    background-color: #1b263b !important; /* mismo azul en todas */
-    color: #ffffff !important;
-}
-
-/* Hover consistente */
-.ag-theme-alpine-dark .ag-row:hover .ag-cell,
-.ag-theme-alpine-dark .ag-row-hover .ag-cell {
-    background-color: #24344d !important;
-}
-
-/* Header en azul más profundo */
-.ag-theme-alpine-dark .ag-header,
-.ag-theme-alpine-dark .ag-header-viewport,
-.ag-theme-alpine-dark .ag-header-row,
-.ag-theme-alpine-dark .ag-header-cell,
-.ag-theme-alpine-dark .ag-floating-filter {
-    background-color: #0d1b2a !important;
-    background-image: none !important; /* <- evita blanqueo por gradiente */
-    color: #ffffff !important;
-}
-
-/* Bordes sutiles */
-.ag-theme-alpine-dark .ag-root-wrapper,
-.ag-theme-alpine-dark .ag-root {
-    border-radius: 10px !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
-}
-
-/* Inputs de filtro */
-.ag-theme-alpine-dark .ag-input-field-input,
-.ag-theme-alpine-dark .ag-text-field-input {
-    background-color: rgba(255,255,255,0.06) !important;
-    color: #ffffff !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    border-radius: 6px !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
 
 DATA_PATH = "data/scrobbles.csv"
 DURATIONS_PATH = "data/durations.csv"
@@ -686,5 +628,137 @@ with tab2:
 # =========================
 
 with tab3:
+
+    # =========================
+    # CLOCK CHART — Listening Time by Hour (Radial)
+    # =========================
+    df_clock = df[(df["datetime"] >= global_start) & (df["datetime"] <= global_end)]
+    df_clock = apply_time_filter(df_clock, global_time_filter).copy()
+
+    if not df_clock.empty:
+        df_clock["hour"] = df_clock["datetime"].dt.hour
+
+        summary_clock = (
+            df_clock.groupby("hour")["duration"].sum().reset_index()
+        )
+        summary_clock["minutes"] = summary_clock["duration"] / 60
+
+        # Convertimos horas a strings para poder ordenarlas correctamente en polar
+        summary_clock["hour_str"] = summary_clock["hour"].astype(str)
+
+        # Orden de horas circular 0–23
+        hour_order = [str(h) for h in range(24)]
+
+        fig_clock = px.line_polar(
+            summary_clock,
+            r="minutes",
+            theta="hour_str",
+            category_orders={"hour_str": hour_order},
+            line_close=True,
+            markers=True,
+            title="Clock Chart — Minutes Listened by Hour",
+        )
+
+        # Estética coherente con la app
+        fig_clock.update_traces(
+            line=dict(color="#FF4B4B", width=3),
+            marker=dict(size=6, color="#FF4B4B")
+        )
+
+        # Ajustes de eje polar estilo reloj
+        fig_clock.update_layout(
+            polar=dict(
+                bgcolor="#111825",   
+                radialaxis=dict(
+                            showticklabels=False,   # Oculta los números
+                            ticks='',               # Quita marcas
+                            showgrid=True,          # Mantiene la rejilla (opcional)
+                            gridcolor="#3a4750",
+                            showline=False,          # Sin línea radial central
+                        ),
+                angularaxis=dict(
+                    direction="clockwise",
+                    rotation=90,        # 0h hacia arriba
+                    color="white",
+                    gridcolor="#3a4750",
+                ),
+            ),
+            font=dict(color="white")
+        )
+
+
+        st.plotly_chart(fig_clock, use_container_width=True)
+
+    else:
+        st.info("No hay datos para el rango seleccionado.")
+
+
     time_of_hour(df, global_start, global_end, global_time_filter)
     time_of_weekday(df, global_start, global_end, global_time_filter)
+
+    # =========================
+    # HEATMAP 1 — Hora (filas) × Día de la semana (columnas)
+    # =========================
+    df_hm = df[(df["datetime"] >= global_start) & (df["datetime"] <= global_end)]
+    df_hm = apply_time_filter(df_hm, global_time_filter).copy()
+
+    df_hm["hour"] = df_hm["datetime"].dt.hour
+    df_hm["weekday"] = df_hm["datetime"].dt.day_name()
+
+    weekday_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+    heatmap1 = (
+        df_hm.groupby(["hour", "weekday"])["duration"].sum()
+        .reset_index()
+        .pivot(index="hour", columns="weekday", values="duration")
+        .reindex(columns=weekday_order)
+        / 60
+    )
+
+    fig_hm1 = px.imshow(
+        heatmap1,
+        labels=dict(x="Weekday", y="Hour", color="Minutes"),
+        title="Heatmap — Minutes by Hour × Weekday",
+        color_continuous_scale=[
+            "#0d1b2a",  # azul casi negro (mínimo)
+            "#3b1c5a",  # púrpura oscuro
+            "#b52a3a",  # rojo vino
+            "#ff6e48",  # naranja brillante
+            "#ffe04b"   # amarillo (máximo)
+        ]
+    )
+    fig_hm1.update_xaxes(side="top")
+    st.plotly_chart(fig_hm1, use_container_width=True)
+
+
+    # =========================
+    # HEATMAP 2 — Día (filas) × Mes (columnas)
+    # =========================
+    df_hm2 = df[(df["datetime"] >= global_start) & (df["datetime"] <= global_end)]
+    df_hm2 = apply_time_filter(df_hm2, global_time_filter).copy()
+
+    df_hm2["weekday"] = df_hm2["datetime"].dt.day_name()
+    df_hm2["month"] = df_hm2["datetime"].dt.strftime("%Y-%m")
+
+    heatmap2 = (
+        df_hm2.groupby(["weekday", "month"])["duration"].sum()
+        .reset_index()
+        .pivot(index="weekday", columns="month", values="duration")
+        .reindex(index=weekday_order)
+        / 60
+    )
+
+    fig_hm2 = px.imshow(
+        heatmap2,
+        labels=dict(x="Month", y="Weekday", color="Minutes"),
+        title="Heatmap — Minutes by Weekday × Month",
+        color_continuous_scale=[
+            "#0d1b2a",
+            "#3b1c5a",
+            "#b52a3a",
+            "#ff6e48",
+            "#ffe04b"
+        ]
+    )
+    fig_hm2.update_xaxes(side="top")
+    st.plotly_chart(fig_hm2, use_container_width=True)
