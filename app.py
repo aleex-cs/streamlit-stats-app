@@ -268,6 +268,16 @@ def top_genre_by_minutes_full_credit(group):
 
     return max(accum.items(), key=lambda kv: kv[1])[0]
 
+def get_decade(y):
+    if pd.isna(y):
+        return None
+    try:
+        y = int(y)
+        decade_start = (y // 10) * 10
+        return f"{decade_start}s"
+    except:
+        return None
+
 # =========================
 # LOAD DATA
 # =========================
@@ -378,6 +388,8 @@ df_genre["genre_single"] = df_genre["genre_single"].apply(normalize_genre_name)
 # Si alguna quedó como None tras normalizar, elimínala
 df_genre = df_genre.dropna(subset=["genre_single"])
 
+df["decade"] = df["year_release"].apply(get_decade)
+df_genre["decade"] = df_genre["year_release"].apply(get_decade)
 
 df_full = df.copy()  # o aplicar filtros si quieres
 df_full.to_csv("full_dataframe_export.csv", index=False, encoding="utf-8")
@@ -429,10 +441,14 @@ def get_listening_summary(df, period="month"):
             "Period": str(period_val),
             "Minutes": round(group["duration"].sum() / 60, 2),
             "Plays": len(group),
+            "Mean Year": round(group["year_release"].dropna().mean(), 2) if "year_release" in group.columns else None,
             "Top Artist": safe_top_by_minutes(group, "artist"),
             "Top Track": safe_top_by_minutes(group, "track"),
             "Top Album": safe_top_by_minutes(group, "album") if "album" in group.columns else None,
             "Top Genre": top_genre_by_minutes_full_credit(group),
+            "Top Decade": get_decade(
+                    group["year_release"].value_counts().idxmax()
+                ) if group["year_release"].notna().any() else None,
         })
 
     return pd.DataFrame(rows).sort_values("Period")
@@ -975,7 +991,6 @@ global_top_n = st.sidebar.slider(
 df = df[(df["year_release"].between(year_range[0], year_range[1]))]
 df_genre = df_genre.merge(df[["datetime","track","artist","album","year_release"]], on=["datetime","track","artist","album"], how="left")
 
-
 # (Opcional) feedback visual
 if quick_range != "Personalizado":
     st.sidebar.caption(
@@ -994,7 +1009,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "Time Patterns",
     "Listening Behavior"
 ])
-
 
 # =========================
 # TAB 1 - Listening Summary
@@ -1085,7 +1099,6 @@ with tab1:
         top_album_series = summary_full.groupby("Top Album").size()
         top_album = top_album_series.idxmax()
         top_album_count = top_album_series.max()
-
         
         # Genre
         if "Top Genre" in summary_full.columns:
@@ -1095,6 +1108,9 @@ with tab1:
         else:
             top_genre, top_genre_count = None, 0
 
+        top_decade_series = summary_full.groupby("Top Decade").size()
+        top_decade = top_decade_series.idxmax()
+        top_decade_count = top_decade_series.max()
 
         # --------------------------
         # Rachas consecutivas
@@ -1105,6 +1121,7 @@ with tab1:
         artist_streak_val, artist_streak_len = longest_streak(summary_sorted["Top Artist"])
         album_streak_val, album_streak_len = longest_streak(summary_sorted["Top Album"])
         genre_streak_val, genre_streak_len = longest_streak(summary_sorted["Top Genre"]) if "Top Genre" in summary_sorted.columns else (None, 0)
+        decade_streak_val, decade_streak_len = longest_streak(summary_sorted["Top Decade"])
 
         first_track_listen = df.groupby("track")["datetime"].min().reset_index()
         new_tracks = first_track_listen[
@@ -1130,6 +1147,17 @@ with tab1:
             (first_genre_listen["datetime"] <= global_end)
         ]
 
+        first_decade_listen = (
+            df[df["decade"].notna()]
+            .groupby("decade")["datetime"]
+            .min()
+            .reset_index(name="first_listen")
+        )
+        new_decades = first_decade_listen[
+            (first_decade_listen["first_listen"] >= global_start) &
+            (first_decade_listen["first_listen"] <= global_end)
+        ]
+
         artist_counts = df_filtered["artist"].value_counts(normalize=True)
         diversity = 1 - (artist_counts**2).sum()
 
@@ -1151,14 +1179,15 @@ with tab1:
                   help=f"{period_min_plays_period} ({period_min_plays_val} plays)")
 
         
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Top Artist most repeated", f"{top_artist} ({top_artist_count})", help=f"{top_artist} ({top_artist_count})")
         c2.metric("Top Track most repeated",  f"{top_track} ({top_track_count})",   help=f"{top_track} ({top_track_count})")
         c3.metric("Top Album most repeated",  f"{top_album} ({top_album_count})",   help=f"{top_album} ({top_album_count})")
         c4.metric("Top Genre most repeated",  f"{top_genre} ({top_genre_count})" if pd.notna(top_genre) else "-",
                    help=f"{top_genre} ({top_genre_count})" if pd.notna(top_genre) else "-")
+        c5.metric("Top Decade most repeated", f"{top_decade} ({top_decade_count})", help=f"{top_decade} ({top_decade_count})")
 
-        r2, r1, r3, r4 = st.columns(4)
+        r2, r1, r3, r4, r5 = st.columns(5)
 
         r2.metric(
             "Longest Top Artist streak",
@@ -1176,13 +1205,18 @@ with tab1:
             "Longest Top Genre streak",
             f"{genre_streak_val} ({genre_streak_len})",
             help=f"{genre_streak_val} ({genre_streak_len})")
+        r5.metric(
+            "Longest Top Decade streak",
+            f"{decade_streak_val} ({decade_streak_len})",
+            help=f"{decade_streak_val} ({decade_streak_len})")
 
-        r1, r2, r3, r4 = st.columns(4)
+        r1, r2, r3, r4, r5 = st.columns(5)
 
         r1.metric("New artists discovered", len(new_artists))
         r2.metric("New tracks discovered", len(new_tracks))
         r3.metric("New albums discovered", len(new_albums))
         r4.metric("New genres discovered", len(new_genres))
+        r5.metric("New decades discovered", len(new_decades))
 
         st.metric("Artist diversity index", round(diversity,3))
         
@@ -1237,7 +1271,6 @@ with tab1:
 
     st.plotly_chart(fig, use_container_width=True)
 
-
 # =========================
 # TAB 2 - Full Data Viewer
 # =========================
@@ -1252,6 +1285,9 @@ with tab2:
     df_fd["artist"] = df_fd["artist"].str.title()
     if "album" in df_fd.columns:
         df_fd["album"] = df_fd["album"].str.title()
+
+    df_fd["decade"] = df_fd["year_release"].apply(get_decade)
+    df_fd_dec = df_fd[df_fd["decade"].notna()]
 
     # ======================================================================
     # Cálculo correcto de días efectivos según los datos disponibles
@@ -1569,6 +1605,68 @@ with tab2:
     else:
         st.write("No hay datos de géneros en el rango/turno seleccionado.")
 
+
+    st.markdown("### Decades")
+
+    n_unique_decades = df_fd_dec["decade"].nunique()
+    avg_minutes_per_decade = round(
+        (df_fd_dec["duration"].sum() / 60) / n_unique_decades, 2
+    ) if n_unique_decades > 0 else 0.0
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Unique decades", n_unique_decades)
+    d2.metric("Minutes per decade", f"{avg_minutes_per_decade:.2f} min")
+    d3.metric("Plays per day", plays_per_day)
+    d4.metric("Minutes per day", f"{minutes_per_day:.2f} min")
+
+    top_dec_val, top_dec_size, first_play, last_play = longest_consecutive_block_details(df_fd_dec, "decade")
+
+    c1, c2, c3 = st.columns(3)
+    if top_dec_val is not None and first_play is not None:
+        c1.metric("Longest decade repeat streak",
+                f"{top_dec_size} plays of {top_dec_val}")
+        c2.metric("First play of the streak", first_play.strftime('%Y-%m-%d %H:%M:%S'))
+        c3.metric("Last play of the streak", last_play.strftime('%Y-%m-%d %H:%M:%S'))
+    else:
+        c1.metric("Longest decade repeat streak", "-")
+        c2.metric("First play of the streak", "-")
+        c3.metric("Last play of the streak", "-")
+
+    dm1, dm2, dm3 = st.columns(3)
+    dec_val_m, dec_minutes, first_m, last_m = longest_consecutive_block_minutes(df_fd_dec, "decade")
+
+    if dec_val_m is not None and first_m is not None:
+        dm1.metric("Longest decade minutes streak",
+                f"{dec_minutes:.2f} min of {dec_val_m}")
+        dm2.metric("First play of minutes streak", first_m.strftime('%Y-%m-%d %H:%M:%S'))
+        dm3.metric("Last play of minutes streak", last_m.strftime('%Y-%m-%d %H:%M:%S'))
+    else:
+        dm1.metric("Longest decade minutes streak", "-")
+        dm2.metric("First play of minutes streak", "-")
+        dm3.metric("Last play of minutes streak", "-")
+
+    decades_summary = (
+        df_fd_dec.groupby("decade")
+        .agg(
+            Minutes=("duration", lambda x: round(x.sum() / 60.0, 2)),
+            Plays=("decade", "count")
+        )
+        .reset_index()
+        .rename(columns={"decade": "Decade"})
+    )
+
+    # Añadir porcentajes
+    total_m = decades_summary["Minutes"].sum()
+    total_p = decades_summary["Plays"].sum()
+
+    decades_summary["Minutes%"] = (decades_summary["Minutes"] / total_m * 100)
+    decades_summary["Plays%"]   = (decades_summary["Plays"] / total_p * 100)
+
+    decades_summary = decades_summary[["Decade", "Minutes", "Minutes%", "Plays", "Plays%"]]
+    decades_summary = decades_summary.sort_values("Minutes", ascending=False).head(global_rows_to_show)
+
+    display_aggrid(decades_summary, container_id="grid_decades")
+
 # =========================
 # TAB 3 - Time Patterns
 # =========================
@@ -1804,8 +1902,11 @@ with tab4:
 
     longest_session = sessions.loc[sessions["length"].idxmax()]
 
-    display_aggrid(sessions.reset_index(drop=True).sort_values("length", ascending=False).head(global_rows_to_show), container_id="grid_sessions")
-
+    sessions_to_show = sessions.drop(columns=["last_duration"])
+    display_aggrid(
+        sessions_to_show.reset_index(drop=True).sort_values("length", ascending=False).head(global_rows_to_show),
+        container_id="grid_sessions"
+    )
     # =========================
     # Track Listening Evolution — afecta a TODOS los filtros globales
     # =========================
