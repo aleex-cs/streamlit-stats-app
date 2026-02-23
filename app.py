@@ -12,7 +12,9 @@ import pytz
 import calendar
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-
+from sklearn.linear_model import LinearRegression
+import numpy as np
+from pmdarima import auto_arima
 
 # =========================
 # CONFIG
@@ -1003,11 +1005,12 @@ if quick_range != "Personalizado":
 # =========================
 
 st.title("Music Stats")
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Summary",
     "Tracks / Artists / Albums",
     "Time Patterns",
-    "Listening Behavior"
+    "Listening Behavior",
+    "Predictions"
 ])
 
 # =========================
@@ -2087,3 +2090,354 @@ with tab4:
 
     dominant = dominant.loc[idx]
     dominant["minutes"] = dominant["duration"]/60
+
+# =========================
+# TAB 5 - Predictions (GAM con Splines - pyGAM)
+# =========================
+with tab5:
+    st.header("📈 Predictions (GAM con Splines)")
+
+    st.write("""
+    Predicciones con **GAM (Generalized Additive Models)** usando *splines*:
+    - Captura **tendencia suave** y **estacionalidad cíclica** (mes/semana/día).
+    - No requiere series perfectamente regulares.
+    - Sin las planicies/serruchos típicos de ARIMA en datos ruidosos.
+    """)
+
+    # -------- Intento de importación de pyGAM --------
+    try:
+        from pygam import LinearGAM, PoissonGAM, s
+    except Exception as e:
+        st.error("Necesitas instalar `pygam` para usar el modelo con splines.\n\n"
+                 "Ejecuta: `pip install pygam`")
+        st.stop()
+
+    # -------- Controles de la UI --------
+    pred_metric = st.selectbox("Métrica a predecir", ["Minutes", "Plays"], index=0)
+    pred_horizon = st.slider("Horizonte (periodos futuros)", 3, 24, 8)
+    show_intervals = st.checkbox("Mostrar intervalos (95%)", True)
+
+    # Hyperparámetros del GAM
+    st.markdown("**Ajustes del modelo (opcional)**")
+    c1, c2, c3 = st.columns(3)
+    trend_splines = c1.slider("Nº splines de tendencia", 5, 60, 20, help="Complejidad de la curva de tendencia")
+    season_splines = c2.slider("Nº splines estacionales", 5, 24, 10, help="Complejidad del ciclo (mes/semana/día)")
+    lam_power = c3.selectbox("Suavizado λ (potencia de 10)", [0,1,2,3,4], index=2,
+                             help="Mayor λ = más suave (10^λ)")
+    lam = 10.0 ** lam_power
+
+    st.caption(f"Periodo actual: {global_period} — Filtros globales aplicados.")
+
+    # -------- Helpers --------
+    def _freq_map(period: str) -> str:
+        if period == "day": return "D"
+        if period == "week": return "W-MON"   # semanas desde Lunes
+        if period == "month": return "MS"     # inicio de mes
+        if period == "year": return "YS"      # inicio de año
+        return "MS"
+
+    def _add_period(df_in: pd.DataFrame, period: str, tz_name: str) -> pd.DataFrame:
+        """Replica la lógica de 'Period' para day/week/month/year."""
+        df_out = df_in.copy()
+        if df_out.empty:
+            df_out["Period"] = pd.NaT
+            return df_out
+
+        if period == "week":
+            df_out["Period"] = (
+                df_out["datetime"].dt.tz_convert(tz_name)
+                .dt.to_period("W").apply(lambda r: r.start_time.date())
+            )
+        elif period == "day":
+            df_out["Period"] = df_out["datetime"].dt.tz_convert(tz_name).dt.date
+        elif period == "month":
+            df_out["Period"] = (
+                df_out["datetime"].dt.tz_convert(tz_name)
+                .dt.to_period("M").apply(lambda r: r.start_time.date())
+            )
+        elif period == "year":
+            df_out["Period"] = (
+                df_out["datetime"].dt.tz_convert(tz_name)
+                .dt.to_period("Y").apply(lambda r: r.start_time.date())
+            )
+        else:
+            df_out["Period"] = (
+                df_out["datetime"].dt.tz_convert(tz_name)
+                .dt.to_period("M").apply(lambda r: r.start_time.date())
+            )
+        return df_out
+
+    def _aggregate_series(df_in: pd.DataFrame, period: str, metric: str) -> pd.DataFrame:
+        """
+        Devuelve DataFrame con columnas: ds(datetime), y(valor).
+        y = Minutes (dur/60) o Plays (conteo).
+        """
+        tmp = _add_period(df_in, period, LOCAL_TZ)
+        agg = tmp.groupby("Period").agg(
+            dur=("duration", "sum"),
+            play=("track", "count")
+        ).reset_index()
+
+        agg["ds"] = pd.to_datetime(agg["Period"])
+        if metric == "Minutes":
+            agg["y"] = agg["dur"] / 60.0
+        else:
+            agg["y"] = agg["play"].astype(float)
+
+        return agg[["ds", "y"]].sort_values("ds").reset_index(drop=True)
+
+    def _make_features(ds: pd.Series, period: str, t_offset:int=0) -> pd.DataFrame:
+        """
+        Crea matriz de features X para GAM:
+          - t_norm: índice temporal normalizado [0..1], con offset para futuro
+          - estacionalidad cíclica según period:
+            * month -> month_of_year (1..12) como variable cíclica
+            * week  -> iso week (1..53) como variable cíclica
+            * day   -> day_of_week (0..6) como variable cíclica
+            * year  -> sin estacionalidad (solo tendencia)
+        Devuelve DataFrame con columnas numéricas para alimentar al GAM.
+        """
+        n = len(ds)
+        t = np.arange(t_offset, t_offset + n, dtype=float)
+        # normalizamos t para estabilidad numérica
+        t_norm = (t - t.min()) / (t.max() - t.min() + 1e-9)
+
+        dfX = pd.DataFrame({"t_norm": t_norm}, index=ds.index)
+
+        if period == "month":
+            month = ds.dt.month.astype(int)  # 1..12
+            # Escala 0..12 para cyclic; pyGAM con constraints='cyclic'
+            dfX["season"] = month.astype(float)
+            which = ["t_norm", "season"]
+        elif period == "week":
+            wk = ds.dt.isocalendar().week.astype(int).astype(float)  # 1..53
+            dfX["season"] = wk
+            which = ["t_norm", "season"]
+        elif period == "day":
+            dow = ds.dt.weekday.astype(int).astype(float)  # 0..6
+            dfX["season"] = dow
+            which = ["t_norm", "season"]
+        else:
+            # year u otros -> sólo tendencia
+            which = ["t_norm"]
+
+        return dfX[which].to_numpy(), which
+
+    def _build_future_index(last_ds: pd.Timestamp, period: str, horizon: int) -> pd.DatetimeIndex:
+        freq = _freq_map(period)
+        return pd.date_range(
+            start=last_ds + pd.tseries.frequencies.to_offset(freq),
+            periods=horizon,
+            freq=freq
+        )
+
+    def _fit_gam_and_forecast(agg_df: pd.DataFrame, period: str, metric: str,
+                              horizon: int, trend_spl:int, season_spl:int, lam_val:float):
+        """
+        Ajusta GAM y genera predicciones + intervalos:
+          - LinearGAM para Minutes
+          - PoissonGAM para Plays
+        Devuelve: yhat (ndarray), ci (ndarray Nx2), future_index (DatetimeIndex), gam, used_seasonal(bool)
+        """
+        y = agg_df["y"].to_numpy()
+        ds = agg_df["ds"]
+
+        if len(agg_df) < 6:
+            raise ValueError("Serie demasiado corta (<6 puntos). Amplía el rango temporal.")
+
+        # Construir X de entrenamiento
+        X_train, cols = _make_features(ds, period, t_offset=0)
+
+        # Definir el modelo
+        # Componente de tendencia
+        if metric == "Plays":
+            gam = PoissonGAM(s(0, n_splines=trend_spl, lam=lam_val))
+        else:
+            gam = LinearGAM(s(0, n_splines=trend_spl, lam=lam_val))
+
+        # Componente estacional si existe 'season' como segunda columna
+        used_seasonal = (X_train.shape[1] > 1)
+        if used_seasonal:
+            # add_term: spline cíclico sobre la segunda columna
+            gam = gam + s(1, n_splines=season_spl, lam=lam_val, constraints='periodic')
+
+        # Ajuste
+        gam.fit(X_train, y)
+
+        # Futuro
+        future_index = _build_future_index(ds.iloc[-1], period, horizon)
+        X_future, _ = _make_features(future_index.to_series(), period, t_offset=len(agg_df))
+
+        # Predicción e intervalos
+        yhat = gam.predict(X_future)
+        ci = gam.confidence_intervals(X_future, width=0.95)
+
+        # No negativos
+        yhat = np.clip(yhat, 0, None)
+        ci[:, 0] = np.clip(ci[:, 0], 0, None)
+        ci[:, 1] = np.clip(ci[:, 1], 0, None)
+
+        return yhat, ci, future_index, gam, used_seasonal
+
+    # --------------------------
+    # Filtrado base global
+    # --------------------------
+    df_pred_base = df[(df["datetime"] >= global_start) & (df["datetime"] <= global_end)]
+    df_pred_base = apply_time_filter(df_pred_base, global_time_filter).copy()
+
+    # =====================================================================
+    # A) PREDICCIÓN GLOBAL (GAM)
+    # =====================================================================
+    st.subheader("A) Predicción Global (GAM)")
+
+    if df_pred_base.empty:
+        st.info("No hay datos en el rango seleccionado.")
+    else:
+        agg = _aggregate_series(df_pred_base, global_period, pred_metric)
+
+        try:
+            with st.spinner("Entrenando GAM..."):
+                yhat, ci, future_index, gam, used_seasonal = _fit_gam_and_forecast(
+                    agg, global_period, pred_metric, pred_horizon,
+                    trend_splines, season_splines, lam
+                )
+
+            # Tabla de salida
+            df_fc = pd.DataFrame({
+                "Period": future_index,
+                "Forecast": yhat,
+                "Lower": ci[:, 0],
+                "Upper": ci[:, 1]
+            })
+
+            # Gráfico
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=agg["ds"], y=agg["y"],
+                mode="lines+markers",
+                name="Histórico",
+                line=dict(color="#4A90E2", width=3)
+            ))
+            fig.add_trace(go.Scatter(
+                x=future_index, y=yhat,
+                mode="lines+markers",
+                name="Forecast (GAM)",
+                line=dict(color="#FF4B4B", width=3, dash="dash")
+            ))
+            if show_intervals:
+                fig.add_trace(go.Scatter(
+                    x=list(future_index) + list(future_index[::-1]),
+                    y=list(ci[:, 1]) + list(ci[:, 0][::-1]),
+                    fill="toself",
+                    fillcolor="rgba(255,75,75,0.15)",
+                    line=dict(color="rgba(0,0,0,0)"),
+                    hoverinfo="skip",
+                    name="Intervalo 95%"
+                ))
+
+            fig.update_layout(
+                title=f"{pred_metric} — Predicción (GAM con splines, próximos {pred_horizon} periodos)"
+                      + (" — con estacionalidad" if used_seasonal else " — sólo tendencia"),
+                template="plotly_dark",
+                xaxis_title="Periodo",
+                yaxis_title=pred_metric
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(df_fc)
+        except Exception as e:
+            st.error(f"No se pudo ajustar el modelo GAM: {e}")
+            st.info("Prueba a ampliar el rango temporal, reducir el horizonte o bajar la complejidad de splines.")
+
+    # =====================================================================
+    # B) PREDICCIÓN POR GÉNERO (GAM)
+    # =====================================================================
+    st.subheader("B) Genre Evolution Forecast (GAM)")
+
+    df_gen_pred = df_genre[(df_genre["datetime"] >= global_start) & (df_genre["datetime"] <= global_end)]
+    df_gen_pred = apply_time_filter(df_gen_pred, global_time_filter).copy()
+    df_gen_pred = df_gen_pred[df_gen_pred["genre_single"].notna()]
+
+    if df_gen_pred.empty:
+        st.info("No hay datos de géneros en el rango seleccionado.")
+    else:
+        topN = st.slider("Top‑N géneros a predecir", 1, 5, 3)
+
+        # Agregamos por Period & género
+        df_gen_pred = _add_period(df_gen_pred, global_period, LOCAL_TZ)
+        agg_all = (
+            df_gen_pred.groupby(["Period", "genre_single"])["duration"]
+            .sum().reset_index()
+        )
+        # Top-N por minutos totales
+        top_genres = (
+            agg_all.groupby("genre_single")["duration"].sum()
+            .sort_values(ascending=False).head(topN).index.tolist()
+        )
+
+        # DataFrame común con ds,y para cada género
+        agg_all["ds"] = pd.to_datetime(agg_all["Period"])
+        agg_all["y"] = agg_all["duration"] / 60.0
+
+        fig_gen = go.Figure()
+        colors = px.colors.qualitative.Bold
+        progress = st.progress(0)
+
+        for i, g in enumerate(top_genres):
+            dfg = agg_all[agg_all["genre_single"] == g].sort_values("ds")[["ds","y"]].reset_index(drop=True)
+
+            if len(dfg) < 6:
+                # Serie corta: pinta histórico y continua
+                fig_gen.add_trace(go.Scatter(
+                    x=dfg["ds"], y=dfg["y"],
+                    mode="lines+markers",
+                    name=f"{g} — Histórico (serie corta)",
+                    line=dict(color=colors[i % len(colors)], width=2)
+                ))
+                progress.progress((i + 1) / len(top_genres))
+                continue
+
+            try:
+                yhat, ci, future_idx, gam_g, used_seasonal_g = _fit_gam_and_forecast(
+                    dfg, global_period, "Minutes", pred_horizon,
+                    trend_splines, season_splines, lam
+                )
+                color = colors[i % len(colors)]
+
+                fig_gen.add_trace(go.Scatter(
+                    x=dfg["ds"], y=dfg["y"],
+                    mode="lines+markers",
+                    name=f"{g} — Histórico",
+                    line=dict(color=color, width=2)
+                ))
+                fig_gen.add_trace(go.Scatter(
+                    x=future_idx, y=yhat,
+                    mode="lines+markers",
+                    name=f"{g} — Pred.",
+                    line=dict(color=color, width=3, dash="dash")
+                ))
+                if show_intervals:
+                    fig_gen.add_trace(go.Scatter(
+                        x=list(future_idx) + list(future_idx[::-1]),
+                        y=list(ci[:, 1]) + list(ci[:, 0][::-1]),
+                        fill="toself",
+                        fillcolor="rgba(255,255,255,0.06)",
+                        line=dict(color="rgba(0,0,0,0)"),
+                        hoverinfo="skip",
+                        showlegend=False
+                    ))
+            except Exception as e:
+                st.warning(f"{g}: no se pudo entrenar el GAM ({e}) — se muestra sólo histórico.")
+
+            progress.progress((i + 1) / len(top_genres))
+
+        fig_gen.update_layout(
+            title=f"Predicción por Género (GAM - Top {topN}, próximos {pred_horizon} periodos)",
+            template="plotly_dark",
+            xaxis_title="Periodo",
+            yaxis_title="Minutes",
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_gen, use_container_width=True)
+
+    st.info("Consejos: usa 'month' o 'week' con histórico suficiente; aumenta λ si ves sobreajuste (curvas muy onduladas).")
