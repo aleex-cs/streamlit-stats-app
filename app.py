@@ -77,7 +77,6 @@ def _sanitize_year(y):
         return None
     return y
 
-
 # =========================
 # THEME / STYLE (ALPINE-DARK REAL + REFUERZO)
 # =========================
@@ -268,8 +267,6 @@ def top_genre_by_minutes_full_credit(group):
         return None
 
     return max(accum.items(), key=lambda kv: kv[1])[0]
-
-
 
 # =========================
 # LOAD DATA
@@ -910,6 +907,7 @@ st.sidebar.title("Filtros Globales")
 quick_range = st.sidebar.selectbox(
     "Quick range",
     [
+        "Todo",
         "Personalizado",
         "Último día",
         "Última semana",
@@ -918,12 +916,11 @@ quick_range = st.sidebar.selectbox(
         "Últimos 6 meses",
         "YTD (año en curso)",
         "Último año",
-        "Todo",
         "Último día natural",
         "Última semana natural",
         "Último mes natural",
     ],
-    index=2  # elige el default que prefieras, p. ej. "Último mes"
+    index=0  # elige el default que prefieras, p. ej. "Último mes"
 )
 
 # Controles de fecha (se usan si quick_range == "Personalizado")
@@ -950,7 +947,6 @@ else:
 year_min = int(df["year_release"].min()) if df["year_release"].notna().any() else 1950
 year_max = int(df["year_release"].max()) if df["year_release"].notna().any() else datetime.now().year
 
-
 global_period = st.sidebar.selectbox("Time period", ["day", "week", "month", "year"], index=2)
 global_time_filter = st.sidebar.selectbox("Time of day", ["All","Morning","Afternoon","Night"], index=0)
 global_rows_to_show = st.sidebar.selectbox(
@@ -972,7 +968,7 @@ global_top_n = st.sidebar.slider(
     max_value=20,
     value=5,
     step=1,
-    help="Número de series (líneas) a mostrar en los gráficos de evolución para artistas, tracks, álbumes y géneros."
+    help="Número de series (líneas) a mostrar en los gráficos de evolución para artistas, tracks, álbumes y géneros.",
 )
 
 # Filtro global por año de lanzamiento (mantén NaN si quieres “No year” aparte)
